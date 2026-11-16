@@ -1,0 +1,530 @@
+/**
+ * Embedded seed dataset from `data.csv` and smart CSV parser/cleaner.
+ *
+ * Allows V2 to bootstrap immediately with clean, deduplicated history (or let
+ * the user import/repair from CSV inside Setup) while staying 100% offline.
+ */
+import {CATEGORIES, guessCategory, UNCATEGORISED} from './categorize';
+import type {Direction, PaymentMode, TxnSource} from './types';
+
+export interface SeedTransactionRow {
+  occurredAt: number;
+  amount: number;
+  direction: Direction;
+  paymentMode: PaymentMode;
+  category: string;
+  counterparty: string | null;
+  upiRef: string | null;
+  accountTail: string | null;
+  instrument: string | null;
+  source: TxnSource;
+  note: string | null;
+  excluded: boolean;
+  categoryLocked: boolean;
+}
+
+const VALID_CATEGORIES = new Set<string>(CATEGORIES);
+const SMS_SENDER_RE = /^[a-z]{2}-[a-z0-9]{3,10}(?:-[a-z0-9]{1,3})?$/i;
+
+function splitCsvLine(line: string): string[] {
+  const cells: string[] = [];
+  let current = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        current += '"';
+        i += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (ch === ',' && !inQuotes) {
+      cells.push(current);
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+  cells.push(current);
+  return cells;
+}
+
+function parseLocalTimestamp(dateStr: string, timeStr: string): number {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const [hh, mm] = (timeStr || '12:00').split(':').map(Number);
+  if (!Number.isFinite(y) || !Number.isFinite(m) || !Number.isFinite(d)) {
+    return Date.now();
+  }
+  return new Date(y, (m || 1) - 1, d || 1, hh || 0, mm || 0, 0, 0).getTime();
+}
+
+function cleanCounterpartyName(raw: string | null): string | null {
+  if (!raw) {
+    return null;
+  }
+  let cleaned = raw.trim();
+  if (!cleaned) {
+    return null;
+  }
+  if (/^view$/i.test(cleaned) || SMS_SENDER_RE.test(cleaned)) {
+    return null;
+  }
+  if (/spotify india/i.test(cleaned)) {
+    return 'Spotify';
+  }
+  cleaned = cleaned
+    .replace(/\b(?:autopay\s+payment\s+of|autopay|private\s+limited|pvt\.?\s*ltd\.?)\b/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return cleaned || null;
+}
+
+function sameLocalDay(a: number, b: number): boolean {
+  const da = new Date(a);
+  const db = new Date(b);
+  return (
+    da.getFullYear() === db.getFullYear() &&
+    da.getMonth() === db.getMonth() &&
+    da.getDate() === db.getDate()
+  );
+}
+
+function isPhantomDuplicate(candidate: SeedTransactionRow, rows: SeedTransactionRow[]): boolean {
+  if (candidate.direction !== 'DEBIT' || candidate.upiRef) {
+    return false;
+  }
+  return rows.some(other => {
+    if (other === candidate || other.direction !== 'CREDIT') {
+      return false;
+    }
+    if (Math.abs(other.amount - candidate.amount) >= 0.01) {
+      return false;
+    }
+    if (Math.abs(other.occurredAt - candidate.occurredAt) > 3 * 60 * 1000) {
+      return false;
+    }
+    const isView = candidate.counterparty === null && candidate.source === 'notification';
+    const isSelfNotification =
+      candidate.source === 'notification' &&
+      Boolean(candidate.counterparty?.toLowerCase().includes('pratham'));
+    return isView || isSelfNotification;
+  });
+}
+
+export interface ParseCsvOptions {
+  smartClean?: boolean;
+}
+
+/**
+ * Parses CSV rows (matching the app's exportCsv() schema and `data.csv`).
+ * With `smartClean: true` (default), repairs V1 parser/categorizer bugs:
+ *  - removes phantom `"View"` / self-name `"paid you"` DEBIT duplicates
+ *  - collapses same-day duplicate Spotify Autopay alerts & duplicate ₹128 SMS
+ *  - marks FASTag toll deductions and ₹1-2 verification pings as `excluded`
+ *  - moves investments (`Invest`, `Olectra greente`, `JPL`, `GCP`) to `Investment`
+ *  - re-categorizes misclassified rows (e.g. `'cred'` substring bug)
+ */
+function stripRaw(
+  item: SeedTransactionRow & {rawCounterparty: string | null},
+): SeedTransactionRow {
+  return {
+    occurredAt: item.occurredAt,
+    amount: item.amount,
+    direction: item.direction,
+    paymentMode: item.paymentMode,
+    category: item.category,
+    counterparty: item.counterparty,
+    upiRef: item.upiRef,
+    accountTail: item.accountTail,
+    instrument: item.instrument,
+    source: item.source,
+    note: item.note,
+    excluded: item.excluded,
+    categoryLocked: item.categoryLocked,
+  };
+}
+
+export function parseCsvRows(
+  csvText: string,
+  options: ParseCsvOptions = {},
+): SeedTransactionRow[] {
+  const smartClean = options.smartClean !== false;
+  const lines = csvText
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .split('\n')
+    .map(l => l.trim())
+    .filter(Boolean);
+
+  if (lines.length === 0) {
+    return [];
+  }
+
+  const startIndex = lines[0].toLowerCase().startsWith('date,time,amount') ? 1 : 0;
+  const parsed: Array<SeedTransactionRow & {rawCounterparty: string | null}> = [];
+
+  for (let i = startIndex; i < lines.length; i += 1) {
+    const cells = splitCsvLine(lines[i]);
+    if (cells.length < 6) {
+      continue;
+    }
+    const [
+      dateStr,
+      timeStr,
+      amountStr,
+      dirRaw,
+      modeRaw,
+      catRaw,
+      cpRaw,
+      upiRefRaw,
+      tailRaw,
+      instrRaw,
+      srcRaw,
+      noteRaw,
+      exclRaw,
+    ] = cells;
+
+    const amount = Number(amountStr);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      continue;
+    }
+
+    const direction: Direction = dirRaw?.trim().toUpperCase() === 'CREDIT' ? 'CREDIT' : 'DEBIT';
+    const paymentMode: PaymentMode = modeRaw?.trim().toUpperCase() === 'CASH' ? 'CASH' : 'UPI';
+    const rawCounterparty = cpRaw?.trim() || null;
+    let counterparty = smartClean ? cleanCounterpartyName(rawCounterparty) : rawCounterparty;
+    const upiRef = upiRefRaw?.trim() || null;
+    const accountTail = tailRaw?.trim() || null;
+    const instrument = instrRaw?.trim() || null;
+    const sourceRaw = (srcRaw?.trim() || 'sms') as TxnSource;
+    const source: TxnSource =
+      sourceRaw === 'notification' ||
+      sourceRaw === 'sms' ||
+      sourceRaw === 'sms-import' ||
+      sourceRaw === 'manual'
+        ? sourceRaw
+        : 'sms';
+    let note = noteRaw?.trim() || null;
+    let excluded = exclRaw?.trim().toLowerCase() === 'yes';
+    const occurredAt = parseLocalTimestamp(dateStr.trim(), timeStr.trim());
+
+    let category = catRaw?.trim() || UNCATEGORISED;
+    if (!VALID_CATEGORIES.has(category)) {
+      category = UNCATEGORISED;
+    }
+
+    if (smartClean) {
+      // Handle 101 CREDIT "View" -> Income with cleared counterparty
+      if (direction === 'CREDIT' && rawCounterparty?.toLowerCase() === 'view') {
+        category = 'Income';
+      }
+
+      // Smart re-categorization for known V1 bugs ('cred' in Transfer, Invest in Other/Bills,
+      // Hair studio in Bills/Transfer, Pills N More snacks, Fipkart, Fuel).
+      const guessed = guessCategory(counterparty, null, direction, [], note);
+      const isWeakOldCategory =
+        category === 'Other' || category === 'Transfer' || category === 'Bills & Utilities';
+      const isExplicitInvestment =
+        category === 'Investment' ||
+        guessed === 'Investment' ||
+        rawCounterparty?.toLowerCase() === 'invest' ||
+        note?.toLowerCase() === 'invest';
+
+      if (isExplicitInvestment) {
+        category = 'Investment';
+        if (counterparty && counterparty.toLowerCase() !== 'invest' && !note) {
+          note = counterparty;
+        }
+        counterparty = 'Invest';
+      } else if (
+        guessed !== UNCATEGORISED &&
+        (isWeakOldCategory || note !== null) &&
+        !(category === 'Entertainment' && note?.toLowerCase().includes('kurta'))
+      ) {
+        category = guessed;
+      }
+
+      // Auto-exclude FASTag blind ₹70 deductions and ₹1-2 account verification pings
+      const isFastagToll =
+        direction === 'DEBIT' &&
+        amount === 70 &&
+        category === 'Travel' &&
+        paymentMode === 'UPI' &&
+        !counterparty &&
+        !upiRef &&
+        !accountTail;
+
+      const isVerificationPing =
+        amount <= 2 &&
+        (rawCounterparty?.toLowerCase() === 'ax-icicit-s' ||
+          rawCounterparty?.toLowerCase().includes('google workspac') ||
+          rawCounterparty?.toLowerCase().includes('pratham') ||
+          (category === 'Other' && !note) ||
+          instrument === 'BANK');
+
+      if (isFastagToll || isVerificationPing) {
+        excluded = true;
+      }
+    }
+
+    parsed.push({
+      occurredAt,
+      amount,
+      direction,
+      paymentMode,
+      category,
+      counterparty,
+      upiRef,
+      accountTail,
+      instrument,
+      source,
+      note,
+      excluded,
+      categoryLocked: category !== UNCATEGORISED,
+      rawCounterparty,
+    });
+  }
+
+  if (!smartClean) {
+    return parsed.map(stripRaw);
+  }
+
+  // Pass 2: Eliminate phantom duplicates & same-day multi-client duplicates
+  const filtered: SeedTransactionRow[] = [];
+  for (const row of parsed) {
+    if (
+      isPhantomDuplicate(
+        {
+          ...row,
+          counterparty: row.rawCounterparty?.toLowerCase().includes('pratham')
+            ? row.rawCounterparty
+            : row.counterparty,
+        },
+        parsed,
+      )
+    ) {
+      continue;
+    }
+
+    // Same-day duplicate Spotify Autopay or duplicate SMS credit without account tail
+    const dupIndex = filtered.findIndex(existing => {
+      if (existing.direction !== row.direction || Math.abs(existing.amount - row.amount) >= 0.01) {
+        return false;
+      }
+      // Same-day autopay notification duplicate (e.g. Spotify ₹69 twice on 2026-10-19)
+      if (
+        !existing.upiRef &&
+        !row.upiRef &&
+        existing.counterparty &&
+        existing.counterparty === row.counterparty &&
+        sameLocalDay(existing.occurredAt, row.occurredAt)
+      ) {
+        return true;
+      }
+      // Duplicate SMS within 5 min where one lacks accountTail/counterparty (e.g. ₹128 on 2026-09-24)
+      if (
+        Math.abs(existing.occurredAt - row.occurredAt) <= 5 * 60 * 1000 &&
+        ((existing.accountTail && !row.accountTail) || (!existing.accountTail && row.accountTail))
+      ) {
+        return true;
+      }
+      return false;
+    });
+
+    if (dupIndex >= 0) {
+      const existing = filtered[dupIndex];
+      // Keep whichever has richer metadata (counterparty + accountTail)
+      const rowScore = (row.counterparty ? 2 : 0) + (row.accountTail ? 1 : 0);
+      const existingScore = (existing.counterparty ? 2 : 0) + (existing.accountTail ? 1 : 0);
+      if (rowScore > existingScore) {
+        filtered[dupIndex] = stripRaw(row);
+      }
+      continue;
+    }
+
+    filtered.push(stripRaw(row));
+  }
+
+  return filtered;
+}
+
+export const SEED_CSV = `date,time,amount,direction,payment_mode,category,counterparty,upi_ref,account_tail,instrument,source,note,excluded
+2026-11-16,18:14,20.00,DEBIT,UPI,Health,,632021634492,911,UPI,sms,,no
+2026-11-16,13:54,50.00,DEBIT,UPI,Other,View,,,,notification,,no
+2026-11-16,13:54,50.00,CREDIT,UPI,Income,Aarav Pradeep P,668603254380,911,UPI,sms,,no
+2026-11-16,13:54,65.00,DEBIT,UPI,Transfer,,632095302250,911,UPI,sms,,no
+2026-11-15,16:44,10.00,DEBIT,UPI,Transfer,Tyre Shop,668578746031,911,UPI,sms,Tyre inflation,no
+2026-11-15,11:26,300.00,DEBIT,UPI,Transfer,Hair X Studio,668583426553,911,UPI,sms,Haircut and beard trimming,no
+2026-11-13,20:47,3.60,CREDIT,UPI,Income,,,,WALLET,sms,,no
+2026-11-13,20:46,36.00,DEBIT,UPI,Food & Drink,Reliance Smart,668370899651,911,UPI,sms,Fanta,no
+2026-11-13,20:40,160.00,DEBIT,UPI,Food & Drink,Garv,668314888836,911,UPI,sms,Mojo pizza,no
+2026-11-13,19:19,15.00,DEBIT,UPI,Transfer,Pills N More,668396594749,911,UPI,sms,Chaas,no
+2026-11-13,18:23,90.00,CREDIT,UPI,Income,,,,,sms,,no
+2026-11-13,16:28,99.00,DEBIT,UPI,Food & Drink,Garv,668310649744,911,UPI,sms,Mc Donalds,no
+2026-11-13,15:48,899.00,DEBIT,UPI,Transfer,Sakshi,668342059080,911,UPI,sms,Gift,no
+2026-11-13,09:06,26.00,DEBIT,UPI,Food & Drink,Godrej One,668329816301,911,UPI,sms,Breakfast,no
+2026-11-12,17:37,9450.00,DEBIT,UPI,Other,Invest,,,,sms,Olectra greente,no
+2026-11-12,16:45,920.00,DEBIT,UPI,Food & Drink,Starbucks,631681271004,911,UPI,sms,Birthday party,no
+2026-11-12,15:17,220.00,CREDIT,UPI,Income,Aanchal Kumari,631618254321,911,UPI,sms,,no
+2026-11-12,15:16,1441.00,DEBIT,UPI,Transfer,Butterfly High,631607866160,911,UPI,sms,Birthday party,no
+2026-11-12,15:16,220.00,CREDIT,UPI,Income,Aarav Pradeep P,668264331880,911,UPI,sms,,no
+2026-11-12,15:14,560.00,CREDIT,UPI,Income,Sakshi Prasad T,631648045515,911,UPI,sms,,no
+2026-11-12,13:46,120.00,DEBIT,UPI,Transfer,Anant,631602664410,911,UPI,sms,"Himanshu's lunch, biryani",no
+2026-11-12,13:19,120.00,CREDIT,UPI,Income,Himanshu Hitesh,631688714743,911,UPI,sms,,no
+2026-11-11,14:06,605.00,DEBIT,UPI,Shopping,Blinkit,668145259407,911,UPI,sms,Bhai dooj gift,no
+2026-11-11,12:37,542.00,DEBIT,UPI,Shopping,Amazon,668120739487,911,UPI,sms,White pant,no
+2026-11-08,01:23,2000.00,DEBIT,UPI,Other,Invest,104440216822,,UPI,sms,,no
+2026-11-08,16:48,7206.62,DEBIT,UPI,Other,Invest,,,,sms,,no
+2026-11-07,17:36,47750.00,CREDIT,UPI,Income,,,,,sms,,no
+2026-11-06,19:03,260.00,DEBIT,UPI,Transfer,Banglore Iyengar Bakery,667650432870,911,UPI,sms,Cakes,no
+2026-11-06,09:20,37.00,DEBIT,UPI,Food & Drink,G1,631085755880,911,UPI,sms,Cold coffee,no
+2026-11-05,18:16,36.00,DEBIT,UPI,Transfer,Shreya,630961713227,911,UPI,sms,Chaayos tea,no
+2026-11-05,14:15,45.00,DEBIT,UPI,Food & Drink,Pills N More,667520677917,911,UPI,sms,Fuse,no
+2026-11-05,10:06,150.00,DEBIT,UPI,Transfer,Samiksha,667537761729,911,UPI,sms,Office boys diwali,no
+2026-11-05,08:51,60.00,CREDIT,UPI,Income,Himanshu Hitesh,630939546258,911,UPI,sms,,no
+2026-11-05,08:51,80.00,CREDIT,UPI,Income,Sakshi Prasad T,667573357249,911,UPI,sms,,no
+2026-11-05,08:51,200.00,DEBIT,UPI,Transfer,,667559951276,911,UPI,sms,,no
+2026-11-04,17:07,60.00,CREDIT,UPI,Income,Himanshu Hitesh,630817564386,911,UPI,sms,,no
+2026-11-04,17:07,130.00,DEBIT,UPI,Food & Drink,Hubble,667427502513,911,UPI,sms,,no
+2026-11-04,13:49,50.00,CREDIT,UPI,Income,Aarav Pradeep P,667460442533,911,UPI,sms,,no
+2026-11-04,13:30,90.00,DEBIT,UPI,Transfer,Pills N More,630882782855,911,UPI,sms,Pepsi black,no
+2026-11-03,14:17,40.00,DEBIT,UPI,Transfer,,667348978624,911,UPI,sms,,no
+2026-11-03,09:31,26.00,DEBIT,UPI,Transfer,,667339950001,911,UPI,sms,,no
+2026-11-02,14:07,40.00,DEBIT,UPI,Food & Drink,Pills N More,630665892504,911,UPI,sms,Chhaas,no
+2026-11-02,14:07,20.00,CREDIT,UPI,Income,Sakshi Prasad T,630661675473,911,UPI,sms,,no
+2026-11-02,09:10,33.00,DEBIT,UPI,Food & Drink,Sakshi,630613071305,911,UPI,sms,Dosa,no
+2026-11-01,12:00,100.00,DEBIT,UPI,Bills & Utilities,Hair X Studio,667195680904,911,UPI,sms,,no
+2026-10-31,18:51,320.00,DEBIT,UPI,Transfer,,667095316687,911,UPI,sms,,no
+2026-10-31,10:05,2254.00,DEBIT,UPI,Shopping,Amazon,630429388562,911,UPI,sms,Shoes,no
+2026-10-30,18:42,405.00,DEBIT,UPI,Transfer,Sanskriti,630318332649,911,UPI,sms,Farewell,no
+2026-10-30,18:40,405.00,CREDIT,UPI,Income,Sakshi Prasad T,630359436303,911,UPI,sms,,no
+2026-10-30,18:40,405.00,DEBIT,UPI,Transfer,Sanskriti,630348326419,911,UPI,sms,Farewell,no
+2026-10-30,08:41,1233.00,CREDIT,UPI,Income,Bank Interest,,,,sms,,no
+2026-10-30,08:19,35000.00,DEBIT,UPI,Transfer,Invest,111037464335,911,UPI,sms,,no
+2026-10-30,08:18,1.00,DEBIT,UPI,Other,Pratham Dipesh Udeshi,,,UPI,notification,,no
+2026-10-30,08:18,1.00,CREDIT,UPI,Income,,111037457574,911,UPI,sms,,no
+2026-10-29,13:51,10.00,DEBIT,UPI,Health,Meds,666870931922,911,UPI,sms,,no
+2026-10-29,13:49,72.00,DEBIT,UPI,Health,Meds,630249999803,911,UPI,sms,,no
+2026-10-29,13:45,1535.00,DEBIT,UPI,Bills & Utilities,Fuel,666860823117,911,UPI,sms,,no
+2026-10-29,09:07,37.00,DEBIT,UPI,Transfer,,630213793377,911,UPI,sms,,no
+2026-10-29,07:11,100.00,CREDIT,UPI,Income,,,911,,sms,,no
+2026-10-28,17:00,8160.00,DEBIT,UPI,Other,Invest,,,,sms,GCP,no
+2026-10-28,15:09,300.00,DEBIT,UPI,Transfer,Anant,630194345740,911,UPI,sms,Gelato,no
+2026-10-28,14:55,1500.00,DEBIT,UPI,Transfer,Anant,630169014184,911,UPI,sms,Sanskriti farewell,no
+2026-10-27,13:49,35.00,DEBIT,UPI,Other,View,,,,notification,,no
+2026-10-27,13:49,35.00,CREDIT,UPI,Income,Sakshi Prasad T,666617558836,911,UPI,sms,,no
+2026-10-27,13:49,95.00,DEBIT,UPI,Transfer,,666647646088,911,UPI,sms,,no
+2026-10-27,09:12,13428.00,DEBIT,UPI,Bills & Utilities,Invest,,,,sms,JPL,no
+2026-10-25,12:37,300.00,CREDIT,UPI,Income,,,,,sms,,no
+2026-10-25,09:11,120.00,DEBIT,UPI,Groceries,,666487840702,911,UPI,sms,,no
+2026-10-25,08:30,87.00,DEBIT,UPI,Transfer,,666479932793,911,UPI,sms,,no
+2026-10-25,08:17,40.00,DEBIT,UPI,Transfer,,666493536255,911,UPI,sms,,no
+2026-10-25,05:53,87.00,DEBIT,UPI,Transfer,,666435638583,911,UPI,sms,,no
+2026-10-23,19:19,20.00,DEBIT,UPI,Transfer,,629611031598,911,UPI,sms,,no
+2026-10-23,19:18,50.00,DEBIT,UPI,Transfer,,629693029479,911,UPI,sms,,no
+2026-10-23,17:58,70.00,DEBIT,UPI,Travel,,,,,sms,,no
+2026-10-23,12:29,200.00,DEBIT,UPI,Transfer,,666242096100,911,UPI,sms,,no
+2026-10-21,19:47,13428.00,CREDIT,UPI,Income,,,,,sms,,no
+2026-10-21,13:45,195.00,DEBIT,UPI,Transfer,,629436141008,911,UPI,sms,,no
+2026-10-21,13:45,45.00,CREDIT,UPI,Income,Sakshi Prasad T,629444229626,911,UPI,sms,,no
+2026-10-21,10:05,20.00,CREDIT,UPI,Income,Sakshi Prasad T,629400013219,911,UPI,sms,,no
+2026-10-19,20:43,400.00,DEBIT,UPI,Transfer,,665886919383,911,UPI,sms,,no
+2026-10-19,20:12,69.00,DEBIT,UPI,Entertainment,SPOTIFY INDIA PVT LTD Autopay payment of,,,,notification,,no
+2026-10-19,18:50,53.00,DEBIT,UPI,Transfer,,629214189379,911,UPI,sms,,no
+2026-10-19,14:26,69.00,DEBIT,UPI,Entertainment,SPOTIFY INDIA PVT LTD Autopay payment of,,,,notification,,no
+2026-10-18,23:03,75.00,DEBIT,UPI,Transfer,,629133331190,911,UPI,sms,,no
+2026-10-17,11:23,285.00,DEBIT,UPI,Transfer,,629023376761,911,UPI,sms,,no
+2026-10-17,11:13,53.00,DEBIT,UPI,Health,,629091558726,911,UPI,sms,,no
+2026-10-16,21:53,2.00,CREDIT,UPI,Income,Google Workspac,825873202896,911,UPI,sms,,no
+2026-10-16,13:01,47.00,DEBIT,UPI,Transfer,,628960315701,911,UPI,sms,,no
+2026-10-15,02:41,181.00,DEBIT,UPI,Transfer,,665582062956,911,UPI,sms,,no
+2026-10-15,00:21,50.00,DEBIT,UPI,Transfer,,665597473701,911,UPI,sms,,no
+2026-10-15,23:37,100.00,DEBIT,UPI,Transfer,,665471179183,911,UPI,sms,,no
+2026-10-15,18:47,55.00,DEBIT,UPI,Transfer,,665441232562,911,UPI,sms,,no
+2026-10-15,15:10,323.00,DEBIT,UPI,Transfer,,665473327011,911,UPI,sms,,no
+2026-10-15,11:03,80.00,DEBIT,UPI,Transfer,,628892399932,911,UPI,sms,,no
+2026-10-14,19:29,60.00,DEBIT,UPI,Transfer,,628729154411,911,UPI,sms,,no
+2026-10-14,13:11,50.00,DEBIT,UPI,Other,View,,,,notification,,no
+2026-10-14,13:11,50.00,CREDIT,UPI,Income,Aarav Pradeep P,628789637838,911,UPI,sms,,no
+2026-10-14,13:11,100.00,DEBIT,UPI,Transfer,,628783936345,911,UPI,sms,,no
+2026-10-13,12:42,30.00,DEBIT,UPI,Transfer,,665252039061,911,UPI,sms,,no
+2026-10-13,08:40,57.00,DEBIT,UPI,Travel,Auto,665216414581,911,UPI,sms,,no
+2026-10-12,18:37,51.00,DEBIT,UPI,Travel,Auto,628546682051,911,UPI,sms,,no
+2026-10-12,09:00,120.00,DEBIT,UPI,Food & Drink,Hubble,628582236273,911,UPI,sms,Breakfast for me and himanshu,no
+2026-10-11,01:11,370.00,DEBIT,UPI,Travel,Uber,628550716513,911,UPI,sms,Travel from dinner place to home,no
+2026-10-11,00:36,61.00,DEBIT,UPI,Transfer,Garv,628509822495,911,UPI,sms,Cab from kora kendra to dinner place,no
+2026-10-11,00:33,123.00,CREDIT,UPI,Income,Minit Mukesh Sh,665170894702,911,UPI,sms,,no
+2026-10-11,00:33,153.00,CREDIT,UPI,Income,Viral Piyush Th,628522922839,911,UPI,sms,,no
+2026-10-11,00:26,193.00,DEBIT,UPI,Food & Drink,Shrusti's Sister,628527627587,911,UPI,sms,Dinner at maa anjani,no
+2026-10-11,22:10,50.00,DEBIT,UPI,Food & Drink,Water,628441418366,911,UPI,sms,,no
+2026-10-11,21:06,50.00,DEBIT,UPI,Food & Drink,Water,665031669815,911,UPI,sms,,no
+2026-10-11,17:14,90.00,DEBIT,UPI,Travel,Metro,665007895035,911,UPI,sms,Ghatkopar to andheri,no
+2026-10-10,19:18,20.00,DEBIT,UPI,Transfer,,664959028452,911,UPI,sms,,no
+2026-10-10,19:04,1596.00,DEBIT,UPI,Shopping,Myntra,664964817564,911,UPI,sms,Pink shirt n white pant,no
+2026-10-10,18:11,160.00,DEBIT,UPI,Transfer,,664975609952,911,UPI,sms,,no
+2026-10-09,21:52,2.00,DEBIT,UPI,Other,,893310122826,911,UPI,sms,,no
+2026-10-09,17:54,70.00,DEBIT,UPI,Travel,,,,,sms,,no
+2026-10-09,09:03,60.00,DEBIT,UPI,Food & Drink,Anant,664897196915,911,UPI,sms,Breakfast Idli,no
+2026-10-08,17:27,7740.00,DEBIT,UPI,Other,Invest,,,,sms,Invest,no
+2026-10-08,13:14,139.00,DEBIT,UPI,Food & Drink,,664764122134,911,UPI,sms,,no
+2026-10-08,09:07,37.00,DEBIT,UPI,Food & Drink,,628192488827,911,UPI,sms,,no
+2026-10-07,00:48,2000.00,DEBIT,UPI,Other,Invest,104206017715,911,UPI,sms,Invest,no
+2026-10-07,20:55,48000.00,CREDIT,UPI,Income,,,,,sms,,no
+2026-10-07,19:36,20.00,DEBIT,UPI,Food & Drink,Apollo Medical,628056142175,911,UPI,sms,Tictac,no
+2026-10-07,13:26,15.00,DEBIT,UPI,Food & Drink,Pills N More,628072807596,911,UPI,sms,Chaas,no
+2026-10-06,20:00,1500.00,DEBIT,UPI,Entertainment,Navratri Clothes,664575989145,911,UPI,sms,Kurta Pajama,no
+2026-10-06,18:46,50.00,DEBIT,CASH,Travel,Auto,,,,manual,,no
+2026-10-06,18:45,120.00,DEBIT,CASH,Food & Drink,Sakshi,,,,manual,,no
+2026-10-06,09:36,1099.00,DEBIT,UPI,Bills & Utilities,VI,664550424271,911,UPI,sms,Mobile recharge,no
+2026-10-05,19:35,750.00,DEBIT,UPI,Entertainment,Nishtha Savla,627891981373,911,UPI,sms,Navratri,no
+2026-10-05,13:37,20.00,DEBIT,UPI,Food & Drink,Medical,627897840617,911,UPI,sms,Tictac,no
+2026-10-05,09:14,25.00,DEBIT,UPI,Food & Drink,Anant,627883631628,911,UPI,sms,Chai,no
+2026-10-03,11:17,55.00,DEBIT,CASH,Travel,Auto,,,,manual,Cash payment for 1st oct,no
+2026-10-02,16:32,2324.00,DEBIT,UPI,Bills & Utilities,Fipkart,664164389159,911,UPI,sms,Laptop charger,no
+2026-10-02,14:02,45.00,DEBIT,UPI,Food & Drink,Railway Canteen,664114271189,911,UPI,sms,Ice cream,no
+2026-10-02,09:05,60.00,DEBIT,UPI,Food & Drink,Hubble,664189643113,911,UPI,sms,Breakfast,no
+2026-10-01,19:00,180.00,DEBIT,UPI,Food & Drink,Naturals,664047616450,911,UPI,sms,Ice cream with Abhishek,no
+2026-10-01,16:12,90.00,DEBIT,UPI,Food & Drink,Hubble Cafeteria,627463570957,911,UPI,sms,Americano,no
+2026-09-30,13:59,35.00,DEBIT,UPI,Transfer,,663909391776,911,UPI,sms,,no
+2026-09-30,13:34,40.00,DEBIT,UPI,Transfer,,663947486936,911,UPI,sms,,no
+2026-09-30,13:13,25.00,DEBIT,UPI,Transfer,,663986097103,911,UPI,sms,,no
+2026-09-30,08:20,1234.00,CREDIT,UPI,Income,,,,,sms,,no
+2026-09-29,17:31,133.50,DEBIT,UPI,Health,,663885044768,911,UPI,sms,,no
+2026-09-29,11:57,826.00,CREDIT,UPI,Shopping,Myntra Designs,104124055139,911,UPI,sms,,no
+2026-09-28,18:58,260.00,DEBIT,UPI,Transfer,,627145678647,911,UPI,sms,,no
+2026-09-28,14:24,1007.00,CREDIT,UPI,Shopping,Myntra Designs,104119593106,911,UPI,sms,,no
+2026-09-28,09:39,1.00,DEBIT,UPI,Other,,104118454777,911,UPI,sms,,no
+2026-09-28,09:36,2000.00,DEBIT,UPI,Transfer,,627121825285,911,UPI,sms,,no
+2026-09-26,23:55,108.00,DEBIT,UPI,Travel,Uber,663524729612,911,UPI,sms,,no
+2026-09-26,23:25,803.00,DEBIT,UPI,Food & Drink,,663552329081,911,UPI,sms,,no
+2026-09-26,17:11,40.00,DEBIT,UPI,Transfer,,626992983039,911,UPI,sms,,no
+2026-09-26,16:47,240.00,DEBIT,UPI,Food & Drink,,626926484327,911,UPI,sms,,no
+2026-09-26,16:36,198.00,DEBIT,UPI,Food & Drink,,626988482278,911,UPI,sms,,no
+2026-09-26,14:32,10.00,DEBIT,UPI,Transfer,,626917181646,911,UPI,sms,,no
+2026-09-26,14:12,10.00,DEBIT,UPI,Transfer,,626991686451,911,UPI,sms,,no
+2026-09-26,10:35,80.00,DEBIT,UPI,Transfer,,626978452964,911,UPI,sms,,no
+2026-09-25,18:30,130.00,DEBIT,UPI,Other,Pratham Chirag Shukla,,,,notification,,no
+2026-09-25,18:30,130.00,CREDIT,UPI,Income,Pratham Chirag,663409804004,911,UPI,sms,,no
+2026-09-25,16:15,70.00,DEBIT,UPI,Transfer,,626805219340,911,UPI,sms,,no
+2026-09-25,13:17,80.00,CREDIT,UPI,Income,Sakshi Prasad T,663492989450,911,UPI,sms,,no
+2026-09-25,13:17,80.00,DEBIT,UPI,Other,View,,,,notification,,no
+2026-09-25,10:49,1.00,CREDIT,UPI,Income,,,911,BANK,sms,,no
+2026-09-25,10:31,40.00,DEBIT,UPI,Transfer,,663493088269,911,UPI,sms,,no
+2026-09-25,08:57,105.00,DEBIT,UPI,Transfer,,663441187524,911,UPI,sms,,no
+2026-09-24,13:52,128.00,CREDIT,UPI,Income,,135200195255,,UPI,sms,,no
+2026-09-24,13:50,128.00,CREDIT,UPI,Income,Himanshu Hitesh,626704764769,911,UPI,sms,,no
+2026-09-24,12:26,513.00,DEBIT,UPI,Food & Drink,,663321526587,911,UPI,sms,,no
+2026-09-24,09:23,145.00,DEBIT,UPI,Food & Drink,,626769893521,911,UPI,sms,,no
+2026-09-23,22:04,29100.00,CREDIT,UPI,Other,Dipesh Krishnak,626636694089,911,UPI,sms,,no
+2026-09-23,17:40,13830.00,DEBIT,UPI,Other,Invest,,,,sms,,no
+2026-09-23,10:07,14280.00,DEBIT,UPI,Other,Invest,,911,,sms,,no
+2026-09-22,21:27,1856.00,DEBIT,UPI,Shopping,,110739031085,911,UPI,sms,,no
+2026-09-22,14:07,35.00,DEBIT,UPI,Transfer,,663153071358,911,UPI,sms,,no
+2026-09-22,08:52,80.00,DEBIT,UPI,Transfer,,663172641038,911,UPI,sms,,no
+2026-09-21,09:50,101.00,CREDIT,UPI,Other,View,,,,notification,,no
+2026-09-20,21:55,924.00,DEBIT,UPI,Shopping,Ad-icicit-s,626359384927,911,UPI,notification,,no
+2026-09-20,19:55,29100.00,DEBIT,UPI,Transfer,Invest,626321378892,911,UPI,notification,,no
+2026-09-20,15:56,1.00,DEBIT,UPI,Transfer,Ax-icicit-s,626376434379,911,UPI,notification,,no
+2026-09-20,15:11,200.00,DEBIT,UPI,Bills & Utilities,Hair Studio,,,,manual,Haircut,no`;

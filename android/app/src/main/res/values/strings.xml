@@ -1,0 +1,17 @@
+<resources>
+    <string name="app_name">Expense Tracker</string>
+
+    <string name="notification_listener_label">Expense Tracker payment capture</string>
+    <string name="widget_name">Monthly spend</string>
+    <string name="widget_description">Total spent this month, updated automatically from your UPI payment alerts.</string>
+    <string name="widget_refresh_description">Refresh spend total</string>
+    <string name="widget_label_placeholder">THIS MONTH</string>
+    <string name="widget_total_placeholder">\u20B90</string>
+    <string name="widget_today_placeholder">Today  \u20B90</string>
+    <string name="widget_tab_today">Today</string>
+    <string name="widget_tab_week">Week</string>
+    <string name="widget_tab_month">Month</string>
+    <string name="widget_tab_combined">Combined</string>
+    <string name="widget_tab_upi">UPI</string>
+    <string name="widget_tab_cash">Cash</string>
+</resources>

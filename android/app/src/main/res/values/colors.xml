@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Widget-only palette. Mirrors src/ui/theme.ts darkPalette/lightPalette;
+         keep the two in sync if either changes. -->
+    <color name="widget_text_dark">#F1F5F9</color>
+    <color name="widget_text_dim_dark">#8B95A7</color>
+    <color name="widget_text_faint_dark">#556074</color>
+    <color name="widget_on_accent_dark">#FFFFFF</color>
+
+    <color name="widget_text_light">#0F172A</color>
+    <color name="widget_text_dim_light">#475569</color>
+    <color name="widget_text_faint_light">#8B95A7</color>
+    <color name="widget_on_accent_light">#FFFFFF</color>
+</resources>
